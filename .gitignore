@@ -1,0 +1,5 @@
+runs/
+test_runs/
+*.log
+.DS_Store
+__pycache__/
