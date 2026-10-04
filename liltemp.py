@@ -22,7 +22,6 @@ MAX_NEW = 160
 TEMPS = [round(0.1 * i, 1) for i in range(1, 16)][::int(os.environ.get("TEMP_STEP", 1))]
 REF = os.environ.get("REF", "Qwen/Qwen2.5-3B")
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
-DTYPE = torch.bfloat16 if DEVICE == "mps" else torch.float32
 
 # (name, repo, revision). order = priority, the first round over all of these is the pilot
 MODELS = [
@@ -89,12 +88,19 @@ def rep4(text: str) -> float:
     return 1 - len(set(grams)) / len(grams) if grams else 0.0
 
 
+# pythia breaks in bf16 (it was trained in fp16), so test models run fp32, fp16 for 2.8b to fit in 16GB
+def dtype_for(repo: str):
+    if repo == REF:
+        return torch.bfloat16
+    return torch.float16 if repo == "EleutherAI/pythia-2.8b" else torch.float32
+
+
 def load(repo: str, rev: str | None):
     tok = AutoTokenizer.from_pretrained(repo, revision=rev)
     assert tok.is_fast, f"{repo} has no fast tokenizer, offsets won't work"
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained(repo, revision=rev, dtype=DTYPE).to(DEVICE).eval()
+    model = AutoModelForCausalLM.from_pretrained(repo, revision=rev, dtype=dtype_for(repo)).to(DEVICE).eval()
     n = sum(p.numel() for p in model.parameters())
     return model, tok, n
 
@@ -166,7 +172,7 @@ def run_block(mi: int, name: str, repo: str, rev: str | None, chunk: int, prompt
     log(f"{name} ({n / 1e6:.0f}M) chunk {chunk}: loaded, batch {bs}")
 
     own = cont_nll(model, tok, pairs, max(8, bs // 4))
-    own_rows = [{"model": name, "idx": i, "nll": a, "bytes": b} for i, (a, b) in zip(idxs, own)]
+    own_rows = [{"model": name, "params": n, "idx": i, "nll": a, "bytes": b} for i, (a, b) in zip(idxs, own)]
 
     gens = []
     for temp in TEMPS:
