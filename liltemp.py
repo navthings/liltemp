@@ -126,27 +126,40 @@ def generate(model, tok, prompts: list[str], temp: float, bs: int, seed: int) ->
     return out
 
 
-# nats spent on the continuation given the context, plus its byte count (for bits per byte)
+# nats spent on the continuation given the context, plus its byte count (for bits per byte).
+# runs the body once, then the vocab projection only on scored positions: full logits for the
+# qwen judge (152k vocab) are several GB per batch and pushed the mac into swap
 @torch.no_grad()
 def cont_nll(model, tok, pairs: list[tuple[str, str]], bs: int) -> list[tuple[float, int]]:
     tok.padding_side = "right"
-    res = []
+    head = model.get_output_embeddings()
+    # length-sorted batches waste far less compute on padding; results go back in the original order
+    order = sorted(range(len(pairs)), key=lambda k: len(pairs[k][0]) + len(pairs[k][1]))
+    out = {}
     for i in range(0, len(pairs), bs):
-        batch = pairs[i:i + bs]
+        if len(pairs) >= 1000 and i and i % (len(pairs) // 4 // bs * bs) == 0:
+            log(f"  scored {i}/{len(pairs)}")
+        ids = order[i:i + bs]
+        batch = [pairs[k] for k in ids]
         enc = tok([c + x for c, x in batch], return_tensors="pt", padding=True, return_offsets_mapping=True)
         starts = enc.pop("offset_mapping")[:, 1:, 0]
         mask = enc["attention_mask"][:, 1:].bool()
         enc = enc.to(DEVICE)
-        logits = model(**enc).logits
+        hidden = model.base_model(**enc).last_hidden_state
         tgt = enc["input_ids"][:, 1:]
         for j, (c, x) in enumerate(batch):
-            if not x.strip():
-                res.append((0.0, 0))
+            keep = ((starts[j] >= len(c)) & mask[j]).nonzero().squeeze(1)
+            if not x.strip() or len(keep) == 0:
+                out[ids[j]] = (0.0, 0)
                 continue
-            nll = F.cross_entropy(logits[j, :-1].float(), tgt[j], reduction="none").cpu()
-            keep = (starts[j] >= len(c)) & mask[j]
-            res.append((nll[keep].sum().item(), len(x.encode())))
-    return res
+            keep = keep.to(DEVICE)
+            logits = head(hidden[j, keep]).float()
+            nll = F.cross_entropy(logits, tgt[j, keep], reduction="sum")
+            out[ids[j]] = (nll.item(), len(x.encode()))
+        del hidden
+        if DEVICE == "mps" and (i // bs) % 20 == 19:
+            torch.mps.empty_cache()
+    return [out[k] for k in range(len(pairs))]
 
 
 def gen_bs(n: int) -> int:
@@ -187,11 +200,12 @@ def run_block(mi: int, name: str, repo: str, rev: str | None, chunk: int, prompt
     free()
 
     ref, rtok, _ = load(REF, None)
-    scored = cont_nll(ref, rtok, [(prompts[g["idx"]][0], g["text"]) for g in gens], 8)
+    log(f"  scoring {len(gens)} texts with {REF}")
+    scored = cont_nll(ref, rtok, [(prompts[g["idx"]][0], g["text"]) for g in gens], 16)
     for g, (a, b) in zip(gens, scored):
         g.update(ref_nll=a, ref_bytes=b, rep4=rep4(g["text"]))
     if chunk not in human_done:
-        hs = cont_nll(ref, rtok, pairs, 8)
+        hs = cont_nll(ref, rtok, pairs, 16)
         append("human.jsonl", [{"idx": i, "ref_nll": a, "ref_bytes": b, "rep4": rep4(c)}
                                for i, (a, b), (_, c) in zip(idxs, hs, pairs)])
         human_done.add(chunk)
