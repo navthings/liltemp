@@ -162,8 +162,9 @@ def cont_nll(model, tok, pairs: list[tuple[str, str]], bs: int) -> list[tuple[fl
     return [out[k] for k in range(len(pairs))]
 
 
+# generation memory (the kv cache) grows with batch x layers x width, and 410m at batch 100 in fp32 swapped the mac
 def gen_bs(n: int) -> int:
-    return 100 if n < 5e8 else 50 if n < 2e9 else 25
+    return 100 if n < 2e8 else 32 if n < 6e8 else 16 if n < 2e9 else 8
 
 
 def append(name: str, rows: list[dict]):
@@ -196,6 +197,7 @@ def run_block(mi: int, name: str, repo: str, rev: str | None, chunk: int, prompt
             gens.append({"model": name, "temp": temp, "idx": i, "text": (" " + " ".join(w)) if w else "", "n_words": len(w)})
         dt = time.time() - t0
         log(f"  {name} T={temp:.1f}  {len(texts) * MAX_NEW / dt:6.0f} tok/s")
+        free()
     del model, tok
     free()
 
